@@ -104,10 +104,12 @@ jobs:
               text, count=1,
           )
 
-          # 2. Replace the `source:` block (next top-level YAML key terminates it)
-          #    with a `path:` pointing at the sibling openmm checkout.
+          # 2. Replace the `source:` block (terminated by the next blank line or
+          #    top-level YAML key) with a `path:` pointing at the sibling openmm
+          #    checkout. Multiline mode only (no dotall) — with dotall, `.*`
+          #    would consume across newlines and devour the rest of the file.
           text = re.sub(
-              r'(?ms)^source:\n(?:[ \t]+.*\n)+',
+              r'(?m)^source:\n(?:[ \t]+.*\n)+',
               "source:\n  path: ../../openmm\n",
               text, count=1,
           )
@@ -132,8 +134,17 @@ jobs:
           p.write_text(text)
           PY
 
-          echo "--- patched meta.yaml (head) ---"
-          head -50 meta.yaml
+          # Sanity check: patched recipe must still contain build / requirements /
+          # script — a bad regex earlier silently deleted the entire tail of the
+          # file, producing a 1-minute empty-package build.
+          for required in "^build:" "^requirements:" "^test:" "build_openmm.sh"; do
+            if ! grep -q "$required" meta.yaml; then
+              echo "::error::patched meta.yaml is missing /$required/ — recipe corrupted"
+              exit 1
+            fi
+          done
+          echo "--- patched meta.yaml (full) ---"
+          cat -n meta.yaml
 
       - name: Build conda package
         shell: bash -el {0}
@@ -147,6 +158,7 @@ jobs:
           conda-build feedstock/recipe \
             -m "feedstock/.ci_support/${MATRIX_FILE}" \
             --output-folder ./conda-bld \
+            --package-format conda \
             --no-anaconda-upload \
             --no-test
           echo "Built artifacts:"
