@@ -176,6 +176,14 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchData.initialize(cc, 3, elementSize, "lineSearchData");
     lineSearchDataBackup.initialize(cc, 3, elementSize, "lineSearchDataBackup");
 
+    // Allocate scratch buffers for deterministic two-pass reductions.  Size is
+    // the maximum number of thread blocks any producer kernel can launch with,
+    // matching cc.getNumThreadBlocks() (the same cap CudaContext, HipContext,
+    // and OpenCLContext apply inside executeKernel()).
+    maxReductionBlocks = cc.getNumThreadBlocks();
+    reductionPartials1.initialize(cc, maxReductionBlocks, elementSize, "reductionPartials1");
+    reductionPartials2.initialize(cc, maxReductionBlocks, elementSize, "reductionPartials2");
+
     // Compile kernels and set arguments.
 
     map<string, string> defines;
@@ -226,7 +234,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
         getConstraintEnergyForcesKernel->addArg(constraintIndices);
         getConstraintEnergyForcesKernel->addArg(constraintDistances);
         getConstraintEnergyForcesKernel->addArg(x);
-        getConstraintEnergyForcesKernel->addArg(returnValue);
+        getConstraintEnergyForcesKernel->addArg(reductionPartials1);
         getConstraintEnergyForcesKernel->addArg(cc.getPaddedNumAtoms());
         getConstraintEnergyForcesKernel->addArg(numConstraints);
         getConstraintEnergyForcesKernel->addArg(); // kRestraint
@@ -274,6 +282,8 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     getScaleKernel->addArg(gradDiff);
     getScaleKernel->addArg(returnFlag);
     getScaleKernel->addArg(returnValue);
+    getScaleKernel->addArg(reductionPartials1);
+    getScaleKernel->addArg(reductionPartials2);
     getScaleKernel->addArg(numVariables);
     getScaleKernel->addArg(); // end
     getScaleKernel->addArg(); // largeGrad
@@ -286,6 +296,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     reinitializeDirKernel->addArg(xDiff);
     reinitializeDirKernel->addArg(returnFlag);
     reinitializeDirKernel->addArg(returnValue);
+    reinitializeDirKernel->addArg(reductionPartials1);
     reinitializeDirKernel->addArg(numVariables);
     reinitializeDirKernel->addArg(); // vectorIndex
     reinitializeDirKernel->addArg(); // largeGrad
@@ -297,6 +308,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     updateDirAlphaKernel->addArg(xDiff);
     updateDirAlphaKernel->addArg(gradDiff);
     updateDirAlphaKernel->addArg(returnFlag);
+    updateDirAlphaKernel->addArg(reductionPartials1);
     updateDirAlphaKernel->addArg(numVariables);
     updateDirAlphaKernel->addArg(); // vectorIndex
 
@@ -307,6 +319,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     scaleDirKernel->addArg(gradDiff);
     scaleDirKernel->addArg(returnFlag);
     scaleDirKernel->addArg(returnValue);
+    scaleDirKernel->addArg(reductionPartials1);
     scaleDirKernel->addArg(numVariables);
     scaleDirKernel->addArg(); // vectorIndex
 
@@ -317,6 +330,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     updateDirBetaKernel->addArg(xDiff);
     updateDirBetaKernel->addArg(gradDiff);
     updateDirBetaKernel->addArg(returnFlag);
+    updateDirBetaKernel->addArg(reductionPartials1);
     updateDirBetaKernel->addArg(numVariables);
     updateDirBetaKernel->addArg(); // vectorIndex
     updateDirBetaKernel->addArg(); // vectorIndexAlpha
@@ -340,6 +354,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchSetupKernel->addArg(returnFlag);
     lineSearchSetupKernel->addArg(gradNorm);
     lineSearchSetupKernel->addArg(lineSearchData);
+    lineSearchSetupKernel->addArg(reductionPartials1);
     lineSearchSetupKernel->addArg(numVariables);
 
     lineSearchStepKernel = program->createKernel("lineSearchStep");
@@ -352,6 +367,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchStepKernel->addArg(gradNorm);
     lineSearchStepKernel->addArg(lineSearchData);
     lineSearchStepKernel->addArg(lineSearchDataBackup);
+    lineSearchStepKernel->addArg(reductionPartials1);
     lineSearchStepKernel->addArg(numVariables);
 
     lineSearchDotKernel = program->createKernel("lineSearchDot");
@@ -360,6 +376,7 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchDotKernel->addArg(lineSearchData);
     lineSearchDotKernel->addArg(returnFlag);
     lineSearchDotKernel->addArg(returnValue);
+    lineSearchDotKernel->addArg(reductionPartials1);
     lineSearchDotKernel->addArg(numVariables);
     lineSearchDotKernel->addArg(); // energy
 
@@ -367,6 +384,15 @@ void CommonMinimizeKernel::setup(ContextImpl& context) {
     lineSearchContinueKernel->addArg(returnFlag);
     lineSearchContinueKernel->addArg(gradNorm);
     lineSearchContinueKernel->addArg(lineSearchData);
+
+    // Generic single-block finalizer that sums a partials buffer into the
+    // selected slot of a destination ComputeArray.  Both the source partials
+    // and destination array are re-bound per call site via setArg().
+    finalizeReductionKernel = program->createKernel("finalizeReduction");
+    finalizeReductionKernel->addArg(); // partials
+    finalizeReductionKernel->addArg(); // dest
+    finalizeReductionKernel->addArg(); // destOffset
+    finalizeReductionKernel->addArg(maxReductionBlocks);
 
     downloadStartEvent = cc.createEvent();
     downloadFinishEvent = cc.createEvent();
@@ -405,12 +431,19 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
         // Prepare for a line search.
 
         energyStart = energy;
+        // lineSearchSetup reduces grad.dir into lineSearchData[LS_DOT_START].
+        cc.clearBuffer(reductionPartials1);
         lineSearchSetupKernel->execute(numVariables);
+        finalizeReduction(reductionPartials1, lineSearchData, 0 /* LS_DOT_START */);
 
         // Take line search steps.
 
         for (int count = 0;; count++) {
+            // lineSearchStep reduces |grad|^2 into gradNorm in the LS_SUCCEED
+            // branch (and writes nothing to partials in the other branches).
+            cc.clearBuffer(reductionPartials1);
             lineSearchStepKernel->execute(numVariables);
+            finalizeReduction(reductionPartials1, gradNorm, 0);
 
             if (count) {
                 int hostReturnFlag = downloadReturnFlagFinish();
@@ -476,13 +509,21 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
 
         downloadReturnFlagStart();
 
-        getScaleKernel->setArg(7, end);
-        getScaleKernel->setArg(8, (int) largeGrad);
+        getScaleKernel->setArg(9, end);
+        getScaleKernel->setArg(10, (int) largeGrad);
         if (largeGrad) {
+            // Fallback single-block path writes scale[end] and returnValue
+            // directly; no finalize needed.
             getScaleKernel->execute(threadBlockSize, threadBlockSize);
         }
         else {
+            // Multi-block path emits two partial-sum buffers (xGrad and
+            // gradGrad).  Each must be reduced deterministically.
+            cc.clearBuffer(reductionPartials1);
+            cc.clearBuffer(reductionPartials2);
             getScaleKernel->execute(numVariables);
+            finalizeReduction(reductionPartials1, scale, end);
+            finalizeReduction(reductionPartials2, returnValue, 0);
         }
 
         int limit = min(numVectors, iteration++);
@@ -491,9 +532,11 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
             end -= numVectors;
         }
 
-        reinitializeDirKernel->setArg(8, vectorIndex);
-        reinitializeDirKernel->setArg(9, (int) largeGrad);
+        reinitializeDirKernel->setArg(9, vectorIndex);
+        reinitializeDirKernel->setArg(10, (int) largeGrad);
+        cc.clearBuffer(reductionPartials1);
         reinitializeDirKernel->execute(numVariables);
+        finalizeReduction(reductionPartials1, alpha, vectorIndex);
 
         for (int vector = 0; vector < limit; vector++) {
             if (vector && --vectorIndex < 0) {
@@ -501,21 +544,34 @@ void CommonMinimizeKernel::lbfgs(ContextImpl& context) {
             }
 
             if (vector < limit - 1) {
-                updateDirAlphaKernel->setArg(7, vectorIndex);
+                updateDirAlphaKernel->setArg(8, vectorIndex);
+                // Destination index inside the kernel:
+                //   vectorIndex2 = (vectorIndex ? vectorIndex : numVectors) - 1
+                int destIndex = (vectorIndex ? vectorIndex : numVectors) - 1;
+                cc.clearBuffer(reductionPartials1);
                 updateDirAlphaKernel->execute(numVariables);
+                finalizeReduction(reductionPartials1, alpha, destIndex);
             }
         }
 
-        scaleDirKernel->setArg(7, vectorIndex);
+        scaleDirKernel->setArg(8, vectorIndex);
+        cc.clearBuffer(reductionPartials1);
         scaleDirKernel->execute(numVariables);
+        // scaleDir reduces into the extra alpha[numVectors] slot.
+        finalizeReduction(reductionPartials1, alpha, numVectors);
 
         for (int vector = 0; vector < limit - 1; vector++) {
             // scaleDirKernel puts its first result in alpha[numVectors], so for the
             // first vector, load the result from here instead of alpha[vectorIndex]
 
-            updateDirBetaKernel->setArg(7, vectorIndex);
-            updateDirBetaKernel->setArg(8, vector ? vectorIndex : numVectors);
+            updateDirBetaKernel->setArg(8, vectorIndex);
+            updateDirBetaKernel->setArg(9, vector ? vectorIndex : numVectors);
+            // Destination index inside the kernel:
+            //   vectorIndex2 = (vectorIndex == numVectors-1 ? 0 : vectorIndex+1)
+            int destIndex = (vectorIndex == numVectors - 1 ? 0 : vectorIndex + 1);
+            cc.clearBuffer(reductionPartials1);
             updateDirBetaKernel->execute(numVariables);
+            finalizeReduction(reductionPartials1, alpha, destIndex);
 
             if (++vectorIndex >= numVectors) {
                 vectorIndex -= numVectors;
@@ -559,7 +615,13 @@ void CommonMinimizeKernel::evaluateGpu(ContextImpl& context) {
         else {
             getConstraintEnergyForcesKernel->setArg(8, (float) kRestraint);
         }
+        // restorePos has already cleared returnValue to 0 (see restorePos in
+        // minimize.cc).  Clear the partials buffer so blocks past the launched
+        // grid contribute 0, then reduce the per-block restraint energies into
+        // returnValue deterministically.
+        cc.clearBuffer(reductionPartials1);
         getConstraintEnergyForcesKernel->execute(numConstraints);
+        finalizeReduction(reductionPartials1, returnValue, 0);
     }
 
     // Convert the forces from fixed to floating point format.  If they are too
@@ -751,11 +813,24 @@ double CommonMinimizeKernel::downloadGradNormSync() {
 
 void CommonMinimizeKernel::runLineSearchKernels() {
     if (mixedIsDouble) {
-        lineSearchDotKernel->setArg(6, isfinite(energy) ? energy - energyStart : (double) std::numeric_limits<float>::max());
+        lineSearchDotKernel->setArg(7, isfinite(energy) ? energy - energyStart : (double) std::numeric_limits<float>::max());
     }
     else {
-        lineSearchDotKernel->setArg(6, isfinite((float) energy) ? (float) (energy - energyStart) : std::numeric_limits<float>::max());
+        lineSearchDotKernel->setArg(7, isfinite((float) energy) ? (float) (energy - energyStart) : std::numeric_limits<float>::max());
     }
+    // lineSearchDot reduces grad . dir into lineSearchData[LS_DOT] via the
+    // deterministic two-pass path.  Clear partials first so blocks that early
+    // return on LS_FAIL/LS_SUCCEED contribute zero.
+    cc.clearBuffer(reductionPartials1);
     lineSearchDotKernel->execute(numVariables);
+    finalizeReduction(reductionPartials1, lineSearchData, 1 /* LS_DOT */);
     lineSearchContinueKernel->execute(1);
+}
+
+void CommonMinimizeKernel::finalizeReduction(ComputeArray& partials, ComputeArray& dest, int destOffset) {
+    finalizeReductionKernel->setArg(0, partials);
+    finalizeReductionKernel->setArg(1, dest);
+    finalizeReductionKernel->setArg(2, destOffset);
+    // numPartials at arg 3 is bound once to maxReductionBlocks in setup().
+    finalizeReductionKernel->execute(threadBlockSize, threadBlockSize);
 }

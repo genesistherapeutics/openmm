@@ -76,6 +76,14 @@ private:
     double downloadReturnValueSync();
     double downloadGradNormSync();
     void runLineSearchKernels();
+    /**
+     * Sum partials[0..maxReductionBlocks-1] in a fixed order using a single
+     * thread block and store the result in dest[destOffset].  Used after each
+     * producer kernel to replace the previous non-deterministic floating-point
+     * atomicAdd-based reductions.  Caller is responsible for clearing the
+     * partials buffer before launching the producer kernel.
+     */
+    void finalizeReduction(ComputeArray& partials, ComputeArray& dest, int destOffset);
 
     ComputeContext& cc;
 
@@ -105,6 +113,13 @@ private:
     ComputeArray xInit, x, xPrev, grad, gradPrev, dir;
     ComputeArray alpha, scale, xDiff, gradDiff;
     ComputeArray returnFlag, returnValue, gradNorm, lineSearchData, lineSearchDataBackup;
+    // Deterministic two-pass reduction scratch space.  Each producer kernel
+    // writes one mixed per launched thread block; finalizeReductionKernel sums
+    // them in a fixed order using a single block.  Two buffers are needed so
+    // getScale can produce both xGrad (-> scale[end]) and gradGrad
+    // (-> returnValue) in a single launch.
+    ComputeArray reductionPartials1, reductionPartials2;
+    int maxReductionBlocks;
 
     ComputeKernel recordInitialPosKernel;
     ComputeKernel restorePosKernel;
@@ -124,6 +139,7 @@ private:
     ComputeKernel lineSearchStepKernel;
     ComputeKernel lineSearchDotKernel;
     ComputeKernel lineSearchContinueKernel;
+    ComputeKernel finalizeReductionKernel;
 
     ComputeEvent downloadStartEvent;
     ComputeEvent downloadFinishEvent;
