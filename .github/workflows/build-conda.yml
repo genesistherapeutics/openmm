@@ -155,23 +155,34 @@ jobs:
         run: |
           set -euo pipefail
           sudo mkdir -p "$CONDA_BLD_PATH" && sudo chown "$USER:" "$CONDA_BLD_PATH"
+          # conda-build 24.5 doesn't support `--package-format conda`. We
+          # produce the legacy .tar.bz2 here and transmute to .conda in the
+          # next step using conda-package-handling.
           conda-build feedstock/recipe \
             -m "feedstock/.ci_support/${MATRIX_FILE}" \
             --output-folder ./conda-bld \
-            --package-format conda \
             --no-anaconda-upload \
             --no-test
           echo "Built artifacts:"
           ls -lh ./conda-bld/linux-64/
 
-      - name: Identify .conda artifact
+      - name: Transmute .tar.bz2 → .conda and identify artifact
         id: artifact
-        shell: bash
+        shell: bash -el {0}
         run: |
           set -euo pipefail
+          TARBALL=$(ls ./conda-bld/linux-64/openmm-*.tar.bz2 | head -1)
+          if [ -z "$TARBALL" ]; then
+            echo "::error::no openmm .tar.bz2 produced by conda-build"
+            ls -la ./conda-bld/linux-64/ || true
+            exit 1
+          fi
+          # cph (conda-package-handling) ships with conda-build and converts
+          # legacy .tar.bz2 to the modern .conda format.
+          cph transmute --out-folder ./conda-bld/linux-64 "$TARBALL" .conda
           PKG=$(ls ./conda-bld/linux-64/openmm-*.conda | head -1)
           if [ -z "$PKG" ]; then
-            echo "::error::no openmm .conda produced"
+            echo "::error::cph transmute did not produce a .conda"
             exit 1
           fi
           BASENAME=$(basename "$PKG")
@@ -181,6 +192,7 @@ jobs:
           echo "package_path=$PKG" >> "$GITHUB_OUTPUT"
           echo "stable_path=$STABLE" >> "$GITHUB_OUTPUT"
           echo "basename=$BASENAME" >> "$GITHUB_OUTPUT"
+          ls -lh ./conda-bld/linux-64/
 
       - name: Upload .conda as workflow artifact
         uses: actions/upload-artifact@v4
