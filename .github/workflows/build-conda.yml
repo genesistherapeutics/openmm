@@ -8,12 +8,16 @@ name: Build Genesis OpenMM conda package
 # Triggers:
 #   - push to master                  → build, upload as workflow artifact
 #   - push of tag matching `genesis-v*` → build, upload artifact, attach to GitHub Release
+#   - pull_request touching this workflow → build, upload artifact (no release)
 #   - workflow_dispatch (with optional release_tag input)
 
 on:
   push:
     branches: [master]
     tags: ['genesis-v*']
+  pull_request:
+    paths:
+      - '.github/workflows/build-conda.yml'
   workflow_dispatch:
     inputs:
       release_tag:
