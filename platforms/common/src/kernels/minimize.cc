@@ -123,40 +123,44 @@ DEVICE mixed reduceMax(mixed value, LOCAL_ARG volatile mixed* temp) {
     return temp[0];
 }
 
-DEVICE void atomicAddMixed(GLOBAL mixed* RESTRICT target, const mixed value) {
-#if defined(__CUDA_ARCH__) || defined(USE_HIP)
+/**
+ * Deterministic per-block partial write helper.  Each thread block writes a
+ * single partial value into partials[GROUP_ID], and a follow-up single-block
+ * finalizeReduction kernel sums those partials in a fixed order.  The host is
+ * responsible for clearing the partials buffer before each producer launch so
+ * blocks that are not launched (when numBlocks > requested grid size) and
+ * kernels that early-return on returnFlag contribute zero.
+ *
+ * This replaces the previous floating-point atomicAdd-based reduction, which
+ * was non-deterministic across runs because the inter-block atomic ordering is
+ * not guaranteed.  The two-pass approach matches the pattern already used by
+ * CudaContext::reduceEnergy().
+ */
+DEVICE void writeReductionPartial(GLOBAL mixed* RESTRICT partials, const mixed value) {
+    partials[GROUP_ID] = value;
+}
 
-    // Do atomic addition of floating-point values directly
-    atomicAdd(target, value);
+/**
+ * Sum a partials buffer (produced by writeReductionPartial across many thread
+ * blocks) and store the result in dest[destOffset].  Must be launched with a
+ * single thread block so the cross-partial reduction order is deterministic.
+ */
+KERNEL void finalizeReduction(
+    GLOBAL const mixed* RESTRICT partials,
+    GLOBAL mixed* RESTRICT dest,
+    const int destOffset,
+    const int numPartials
+) {
+    LOCAL volatile mixed temp[TEMP_SIZE];
 
-#elif defined(__OPENCL_VERSION__)
-    #if defined(USE_MIXED_PRECISION) || defined(USE_DOUBLE_PRECISION)
-
-    // Do 64-bit atomic compare/exchange (requires cl_khr_int64_base_atomics;
-    // this will be checked on the host before trying to compile this kernel)
-
-    unsigned long old = as_ulong(*target);
-    unsigned long check;
-    do {
-        check = old;
-        old = atom_cmpxchg((GLOBAL unsigned long*)target, check, as_ulong(value + as_double(check)));
-    } while(check != old);
-
-    #else
-
-    // Do 32-bit atomic compare/exchange
-
-    unsigned int old = as_uint(*target);
-    unsigned int check;
-    do {
-        check = old;
-        old = atomic_cmpxchg((GLOBAL unsigned int*)target, check, as_uint(value + as_float(check)));
-    } while(check != old);
-
-    #endif
-#else
-    #error "Internal error: atomicAddMixed is missing an implementation for this platform"
-#endif
+    mixed sum = 0;
+    for (int i = LOCAL_ID; i < numPartials; i += LOCAL_SIZE) {
+        sum += partials[i];
+    }
+    sum = reduceAdd(sum, temp);
+    if (LOCAL_ID == 0) {
+        dest[destOffset] = sum;
+    }
 }
 
 KERNEL void recordInitialPos(
@@ -252,7 +256,7 @@ KERNEL void getConstraintEnergyForces(
     GLOBAL const int2* RESTRICT constraintIndices,
     GLOBAL const mixed* RESTRICT constraintDistances,
     GLOBAL const mixed* RESTRICT x,
-    GLOBAL mixed* RESTRICT returnValue,
+    GLOBAL mixed* RESTRICT partials,
     const int numPadded,
     const int numConstraints,
     const mixed kRestraint
@@ -287,7 +291,7 @@ KERNEL void getConstraintEnergyForces(
     energy = reduceAdd(energy, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(returnValue, energy);
+        writeReductionPartial(partials, energy);
     }
 }
 
@@ -426,6 +430,8 @@ KERNEL void getScale(
     GLOBAL const mixed* RESTRICT gradDiff,
     GLOBAL const int* RESTRICT returnFlag,
     GLOBAL mixed* RESTRICT returnValue,
+    GLOBAL mixed* RESTRICT partials1,
+    GLOBAL mixed* RESTRICT partials2,
     const int numVariables,
     const int end,
     const int largeGrad
@@ -476,8 +482,8 @@ KERNEL void getScale(
         gradGrad = reduceAdd(gradGrad, temp);
 
         if (LOCAL_ID == 0) {
-            atomicAddMixed(&scale[end], xGrad);
-            atomicAddMixed(returnValue, gradGrad);
+            writeReductionPartial(partials1, xGrad);
+            writeReductionPartial(partials2, gradGrad);
         }
     }
 
@@ -497,6 +503,7 @@ KERNEL void reinitializeDir(
     GLOBAL const mixed* RESTRICT xDiff,
     GLOBAL const int* RESTRICT returnFlag,
     GLOBAL mixed* RESTRICT returnValue,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables,
     const int vectorIndex,
     const int largeGrad
@@ -508,8 +515,9 @@ KERNEL void reinitializeDir(
     }
 
     if (GLOBAL_ID == 0 && !largeGrad) {
-        // The last kernel used atomics to do its reduction.  returnValue has
-        // gradGrad, so finish up by replacing it with xGrad / gradGrad.
+        // The previous kernel (getScale) deposited gradGrad into returnValue
+        // via the deterministic reduction pipeline.  Replace it with
+        // xGrad/gradGrad here, which downstream kernels read as the outerScale.
 
         *returnValue = scale[vectorIndex] / *returnValue;
     }
@@ -524,7 +532,7 @@ KERNEL void reinitializeDir(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex], vectorAlpha / scale[vectorIndex]);
+        writeReductionPartial(partials, vectorAlpha / scale[vectorIndex]);
     }
 }
 
@@ -535,6 +543,7 @@ KERNEL void updateDirAlpha(
     GLOBAL const mixed* RESTRICT xDiff,
     GLOBAL const mixed* RESTRICT gradDiff,
     GLOBAL const int* RESTRICT returnFlag,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables,
     const int vectorIndex1
 ) {
@@ -557,7 +566,7 @@ KERNEL void updateDirAlpha(
     vectorAlpha = reduceAdd(vectorAlpha, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex2], vectorAlpha / scale[vectorIndex2]);
+        writeReductionPartial(partials, vectorAlpha / scale[vectorIndex2]);
     }
 }
 
@@ -568,6 +577,7 @@ KERNEL void scaleDir(
     GLOBAL const mixed* RESTRICT gradDiff,
     GLOBAL const int* RESTRICT returnFlag,
     GLOBAL const mixed* RESTRICT returnValue,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables,
     const int vectorIndex
 ) {
@@ -589,10 +599,16 @@ KERNEL void scaleDir(
     vectorBeta = reduceAdd(vectorBeta, temp);
 
     if (LOCAL_ID == 0) {
-        // Store the result in an extra slot alpha[NUM_VECTORS] instead of using
-        // alpha[vectorIndex] since other blocks might still need to read it.
+        // Each block contributes -vectorBeta/scale[vectorIndex] and the very
+        // first block additionally contributes innerScale.  The deterministic
+        // finalize sums these partials into alpha[NUM_VECTORS], reproducing the
+        // original atomicAdd semantics in a fixed order.
 
-        atomicAddMixed(&alpha[NUM_VECTORS], (GLOBAL_ID == 0 ? innerScale : 0) - vectorBeta / scale[vectorIndex]);
+        mixed contribution = -vectorBeta / scale[vectorIndex];
+        if (GROUP_ID == 0) {
+            contribution += innerScale;
+        }
+        writeReductionPartial(partials, contribution);
     }
 }
 
@@ -603,6 +619,7 @@ KERNEL void updateDirBeta(
     GLOBAL const mixed* RESTRICT xDiff,
     GLOBAL const mixed* RESTRICT gradDiff,
     GLOBAL const int* RESTRICT returnFlag,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables,
     const int vectorIndex1,
     const int vectorIndexAlpha
@@ -626,7 +643,17 @@ KERNEL void updateDirBeta(
     vectorBeta = reduceAdd(vectorBeta, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&alpha[vectorIndex2], -vectorBeta / scale[vectorIndex2]);
+        // The original kernel accumulated -vectorBeta/scale into
+        // alpha[vectorIndex2], which already holds the phase-1 alpha for that
+        // slot (so the final value is "alpha - beta/scale", consumed by later
+        // L-BFGS kernels).  finalizeReduction overwrites the destination, so
+        // fold the existing alpha[vectorIndex2] into block 0's partial to
+        // preserve the accumulating semantics.
+        mixed contribution = -vectorBeta / scale[vectorIndex2];
+        if (GROUP_ID == 0) {
+            contribution += alpha[vectorIndex2];
+        }
+        writeReductionPartial(partials, contribution);
     }
 }
 
@@ -667,6 +694,7 @@ KERNEL void lineSearchSetup(
     GLOBAL int* RESTRICT returnFlag,
     GLOBAL mixed* RESTRICT gradNorm,
     GLOBAL mixed* RESTRICT lineSearchData,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables
 ) {
     LOCAL volatile mixed temp[TEMP_SIZE];
@@ -686,7 +714,7 @@ KERNEL void lineSearchSetup(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&lineSearchData[LS_DOT_START], result);
+        writeReductionPartial(partials, result);
     }
 
     if (GLOBAL_ID == 0) {
@@ -705,6 +733,7 @@ KERNEL void lineSearchStep(
     GLOBAL mixed* RESTRICT gradNorm,
     GLOBAL mixed* RESTRICT lineSearchData,
     GLOBAL mixed* RESTRICT lineSearchDataBackup,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables
 ) {
     LOCAL volatile mixed temp[TEMP_SIZE];
@@ -726,7 +755,7 @@ KERNEL void lineSearchStep(
         norm = reduceAdd(norm, temp);
 
         if (LOCAL_ID == 0) {
-            atomicAddMixed(gradNorm, norm);
+            writeReductionPartial(partials, norm);
         }
 
         return;
@@ -765,6 +794,7 @@ KERNEL void lineSearchDot(
     GLOBAL mixed* RESTRICT lineSearchData,
     GLOBAL int* RESTRICT returnFlag,
     GLOBAL const mixed* RESTRICT returnValue,
+    GLOBAL mixed* RESTRICT partials,
     const int numVariables,
     mixed deltaEnergy
 ) {
@@ -797,7 +827,7 @@ KERNEL void lineSearchDot(
     result = reduceAdd(result, temp);
 
     if (LOCAL_ID == 0) {
-        atomicAddMixed(&lineSearchData[LS_DOT], result);
+        writeReductionPartial(partials, result);
     }
 }
 

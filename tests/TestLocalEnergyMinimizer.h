@@ -342,6 +342,53 @@ void testReporter() {
     ASSERT_EQUAL_TOL(state.getPotentialEnergy(), reporter.lastEnergy, 1e-5);
 }
 
+void testDeterminism() {
+    // Run the same minimization twice from identical inputs and require that
+    // the resulting positions and forces are bit-for-bit equal.  This protects
+    // against regressions in the deterministic GPU L-BFGS reduction pipeline.
+
+    const int numParticles = 30;
+    System system;
+    CustomExternalForce* externalForce = new CustomExternalForce("sin(5*x)+cos(2*y)*(sin(3*z)+1.5)");
+    system.addForce(externalForce);
+    NonbondedForce* nonbonded = new NonbondedForce();
+    system.addForce(nonbonded);
+    vector<Vec3> positions;
+    for (int i = 0; i < numParticles; i++) {
+        system.addParticle(1.0);
+        externalForce->addParticle(i);
+        nonbonded->addParticle(0.0, 0.2, 1.0);
+        positions.push_back(Vec3(0.5*i, 0.3*sin(i), 0.2*cos(i)));
+        if (i > 0)
+            system.addConstraint(i-1, i, 1.0);
+    }
+
+    auto runOnce = [&]() {
+        VerletIntegrator integrator(0.01);
+        Context context(system, integrator, platform);
+        context.setPositions(positions);
+        context.applyConstraints(1e-5);
+        LocalEnergyMinimizer::minimize(context, 1e-4, 50);
+        State state = context.getState(State::Positions | State::Forces | State::Energy);
+        return state;
+    };
+
+    State state1 = runOnce();
+    State state2 = runOnce();
+
+    const vector<Vec3>& p1 = state1.getPositions();
+    const vector<Vec3>& p2 = state2.getPositions();
+    const vector<Vec3>& f1 = state1.getForces();
+    const vector<Vec3>& f2 = state2.getForces();
+    for (int i = 0; i < numParticles; i++) {
+        for (int j = 0; j < 3; j++) {
+            ASSERT_EQUAL(p1[i][j], p2[i][j]);
+            ASSERT_EQUAL(f1[i][j], f2[i][j]);
+        }
+    }
+    ASSERT_EQUAL(state1.getPotentialEnergy(), state2.getPotentialEnergy());
+}
+
 void runPlatformTests();
 
 int main(int argc, char* argv[]) {
@@ -354,6 +401,7 @@ int main(int argc, char* argv[]) {
         testForceGroups();
         testMasslessParticles();
         testReporter();
+        testDeterminism();
         runPlatformTests();
     }
     catch(const exception& e) {
