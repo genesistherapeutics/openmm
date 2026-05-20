@@ -346,21 +346,40 @@ void testDeterminism() {
     // Run the same minimization twice from identical inputs and require that
     // the resulting positions and forces are bit-for-bit equal.  This protects
     // against regressions in the deterministic GPU L-BFGS reduction pipeline.
+    //
+    // Forces deliberately exercise:
+    //   * the constraint-restraint energy path in minimize.cc (constraints),
+    //   * a per-particle field that exercises the L-BFGS line-search (sin/cos),
+    //   * a HarmonicBondForce providing inter-particle coupling without any
+    //     non-deterministic atomic accumulation (BondedUtilities uses
+    //     fixed-point integer atomics on every platform).
+    //
+    // We deliberately avoid NonbondedForce here.  On platforms whose
+    // NonbondedForce kernels accumulate per-thread floats via cmpxchg-style
+    // atomics (the CPU/OpenCL runtime in particular), the forces themselves
+    // are bit-non-deterministic at ~1 ULP, which the L-BFGS line-search will
+    // faithfully amplify — that is a property of the force code, not of the
+    // optimizer this test is checking.
 
     const int numParticles = 30;
     System system;
     CustomExternalForce* externalForce = new CustomExternalForce("sin(5*x)+cos(2*y)*(sin(3*z)+1.5)");
     system.addForce(externalForce);
-    NonbondedForce* nonbonded = new NonbondedForce();
-    system.addForce(nonbonded);
+    HarmonicBondForce* bonds = new HarmonicBondForce();
+    system.addForce(bonds);
     vector<Vec3> positions;
     for (int i = 0; i < numParticles; i++) {
         system.addParticle(1.0);
         externalForce->addParticle(i);
-        nonbonded->addParticle(0.0, 0.2, 1.0);
         positions.push_back(Vec3(0.5*i, 0.3*sin(i), 0.2*cos(i)));
-        if (i > 0)
+        if (i > 0) {
             system.addConstraint(i-1, i, 1.0);
+            // Add a non-trivial bonded force across the chain to give the
+            // line-search something interesting to do without introducing
+            // any non-deterministic float accumulation.
+            if (i > 1)
+                bonds->addBond(i-2, i, 1.5, 100.0);
+        }
     }
 
     auto runOnce = [&]() {
