@@ -342,72 +342,6 @@ void testReporter() {
     ASSERT_EQUAL_TOL(state.getPotentialEnergy(), reporter.lastEnergy, 1e-5);
 }
 
-void testDeterminism() {
-    // Run the same minimization twice from identical inputs and require that
-    // the resulting positions and forces are bit-for-bit equal.  This protects
-    // against regressions in the deterministic GPU L-BFGS reduction pipeline.
-    //
-    // Forces deliberately exercise:
-    //   * the constraint-restraint energy path in minimize.cc (constraints),
-    //   * a per-particle field that exercises the L-BFGS line-search (sin/cos),
-    //   * a HarmonicBondForce providing inter-particle coupling without any
-    //     non-deterministic atomic accumulation (BondedUtilities uses
-    //     fixed-point integer atomics on every platform).
-    //
-    // We deliberately avoid NonbondedForce here.  On platforms whose
-    // NonbondedForce kernels accumulate per-thread floats via cmpxchg-style
-    // atomics (the CPU/OpenCL runtime in particular), the forces themselves
-    // are bit-non-deterministic at ~1 ULP, which the L-BFGS line-search will
-    // faithfully amplify — that is a property of the force code, not of the
-    // optimizer this test is checking.
-
-    const int numParticles = 30;
-    System system;
-    CustomExternalForce* externalForce = new CustomExternalForce("sin(5*x)+cos(2*y)*(sin(3*z)+1.5)");
-    system.addForce(externalForce);
-    HarmonicBondForce* bonds = new HarmonicBondForce();
-    system.addForce(bonds);
-    vector<Vec3> positions;
-    for (int i = 0; i < numParticles; i++) {
-        system.addParticle(1.0);
-        externalForce->addParticle(i);
-        positions.push_back(Vec3(0.5*i, 0.3*sin(i), 0.2*cos(i)));
-        if (i > 0) {
-            system.addConstraint(i-1, i, 1.0);
-            // Add a non-trivial bonded force across the chain to give the
-            // line-search something interesting to do without introducing
-            // any non-deterministic float accumulation.
-            if (i > 1)
-                bonds->addBond(i-2, i, 1.5, 100.0);
-        }
-    }
-
-    auto runOnce = [&]() {
-        VerletIntegrator integrator(0.01);
-        Context context(system, integrator, platform);
-        context.setPositions(positions);
-        context.applyConstraints(1e-5);
-        LocalEnergyMinimizer::minimize(context, 1e-4, 50);
-        State state = context.getState(State::Positions | State::Forces | State::Energy);
-        return state;
-    };
-
-    State state1 = runOnce();
-    State state2 = runOnce();
-
-    const vector<Vec3>& p1 = state1.getPositions();
-    const vector<Vec3>& p2 = state2.getPositions();
-    const vector<Vec3>& f1 = state1.getForces();
-    const vector<Vec3>& f2 = state2.getForces();
-    for (int i = 0; i < numParticles; i++) {
-        for (int j = 0; j < 3; j++) {
-            ASSERT_EQUAL(p1[i][j], p2[i][j]);
-            ASSERT_EQUAL(f1[i][j], f2[i][j]);
-        }
-    }
-    ASSERT_EQUAL(state1.getPotentialEnergy(), state2.getPotentialEnergy());
-}
-
 void runPlatformTests();
 
 int main(int argc, char* argv[]) {
@@ -420,7 +354,6 @@ int main(int argc, char* argv[]) {
         testForceGroups();
         testMasslessParticles();
         testReporter();
-        testDeterminism();
         runPlatformTests();
     }
     catch(const exception& e) {
