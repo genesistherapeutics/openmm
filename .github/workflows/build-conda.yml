@@ -29,14 +29,12 @@ permissions:
   contents: write  # needed for `gh release create` on tag pushes
 
 env:
-  # Pin the conda-forge openmm-feedstock to the "Build 8.5.1" commit so the matrix
-  # files and recipe template are reproducible. Bump explicitly when conda-forge
-  # publishes a new openmm version.
+  # Pin the conda-forge openmm-feedstock to the "Build 8.5.1" commit so the
+  # matrix files and recipe template are reproducible. The fork's
+  # CMakeLists.txt also declares 8.5.1 (cherry-picked f7fa0c27c from upstream
+  # tag 8.5.1), so the recipe and source agree without any version override.
+  # Bump explicitly when conda-forge publishes a new openmm version.
   FEEDSTOCK_REF: c748fc67e97f7e6c64cc56942002adf3f2bd9cb9
-  # Matches the openmm version in CMakeLists.txt on this fork. The feedstock at
-  # FEEDSTOCK_REF templates 8.5.1, so we override it back to 8.5.0 to keep the
-  # package version aligned with the source.
-  GENESIS_OPENMM_VERSION: "8.5.0"
   MATRIX_FILE: linux_64_c_stdlib_version2.28cuda_compiler_version13.0python3.12.____cpython.yaml
 
 jobs:
@@ -89,7 +87,7 @@ jobs:
           cd feedstock/recipe
           # SHORT_SHA exported from `github.sha` (full 40-char SHA); trim to 8 chars.
           SHORT_SHA="${SHORT_SHA:0:8}"
-          export SHORT_SHA GENESIS_OPENMM_VERSION
+          export SHORT_SHA
 
           python - <<'PY'
           import os, re, pathlib
@@ -97,28 +95,24 @@ jobs:
           p = pathlib.Path("meta.yaml")
           text = p.read_text()
 
-          # 1. Pin the templated version to the fork's CMakeLists.txt version.
-          text = re.sub(
-              r'\{%\s*set\s+version\s*=\s*"[^"]+"\s*%\}',
-              '{%% set version = "%s" %%}' % os.environ["GENESIS_OPENMM_VERSION"],
-              text, count=1,
-          )
+          # The recipe at FEEDSTOCK_REF templates the same version (8.5.1) that
+          # this fork's CMakeLists.txt declares, so no version rewrite needed.
 
-          # 2. Replace the `source:` block (terminated by the next blank line or
-          #    top-level YAML key) with a `path:` pointing at the sibling openmm
-          #    checkout. Multiline mode only (no dotall) — with dotall, `.*`
-          #    would consume across newlines and devour the rest of the file.
+          # Replace the `source:` block (terminated by the next blank line or
+          # top-level YAML key) with a `path:` pointing at the sibling openmm
+          # checkout. Multiline mode only (no dotall) — with dotall, `.*`
+          # would consume across newlines and devour the rest of the file.
           text = re.sub(
               r'(?m)^source:\n(?:[ \t]+.*\n)+',
               "source:\n  path: ../../openmm\n",
               text, count=1,
           )
 
-          # 3. Mark the build with `_genesis_<shortsha>` so the binary sorts above
-          #    conda-forge's build of the same version (channel priority still
-          #    decides selection, but this keeps reproducibility clear).
-          #    The recipe templates string: only on osx; on linux conda-build
-          #    generates the default. Inject a linux-only string override.
+          # Mark the build with `_genesis_<shortsha>` so the binary sorts above
+          # conda-forge's build of the same version (channel priority still
+          # decides selection, but this keeps reproducibility clear).
+          # The recipe templates string: only on osx; on linux conda-build
+          # generates the default. Inject a linux-only string override.
           short = os.environ["SHORT_SHA"]
           linux_string = (
               '  string: "py{{ PY_VER.replace(\'.\', \'\') }}h'
