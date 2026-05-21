@@ -200,6 +200,10 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh release infers the target repo from the local git remote, but
+          # the openmm checkout is in a `path: openmm` subdir so $cwd has no
+          # .git.  Pin the repo explicitly so gh doesn't try to read git.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -213,13 +217,15 @@ jobs:
             gh release create "$TAG" \
               "${{ steps.artifact.outputs.package_path }}" \
               "${{ steps.artifact.outputs.stable_path }}" \
-              --title "$TAG" --notes "$NOTES"
+              --title "$TAG" --notes "$NOTES" --target "${GITHUB_SHA}"
           fi
 
       - name: Attach to GitHub Release (manual dispatch with release_tag)
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          # See the tag-push step above for why this is needed.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${{ inputs.release_tag }}"
@@ -233,5 +239,5 @@ jobs:
             gh release create "$TAG" \
               "${{ steps.artifact.outputs.package_path }}" \
               "${{ steps.artifact.outputs.stable_path }}" \
-              --title "$TAG" --notes "$NOTES"
+              --title "$TAG" --notes "$NOTES" --target "${GITHUB_SHA}"
           fi
