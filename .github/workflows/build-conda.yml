@@ -1,9 +1,12 @@
-name: Build Genesis OpenMM conda package
+name: Build Genesis OpenMM conda packages
 
-# Builds a linux-64 / CUDA 13 / Python 3.12 conda package of this fork using the
-# conda-forge/openmm-feedstock recipe, with the source swapped to point at this
+# Builds linux-64 conda packages of this fork (CUDA 13, CUDA 12, CPU-only) using
+# the conda-forge/openmm-feedstock recipe, with the source swapped to point at this
 # checkout and a `_genesis_<shortsha>` suffix appended to the build string so the
 # Genesis build sorts above the conda-forge build of the same version.
+#
+# The three variants let the conda solver auto-select the right package via
+# the __cuda virtual package on any host.
 #
 # Triggers:
 #   - push to master                  → build, upload as workflow artifact
@@ -35,16 +38,26 @@ env:
   # tag 8.5.1), so the recipe and source agree without any version override.
   # Bump explicitly when conda-forge publishes a new openmm version.
   FEEDSTOCK_REF: c748fc67e97f7e6c64cc56942002adf3f2bd9cb9
-  MATRIX_FILE: linux_64_c_stdlib_version2.28cuda_compiler_version13.0python3.12.____cpython.yaml
 
 jobs:
   build:
-    name: linux-64 / CUDA 13 / py3.12
+    name: linux-64 / ${{ matrix.label }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: CUDA 13 / py3.12
+            matrix_file: linux_64_c_stdlib_version2.28cuda_compiler_version13.0python3.12.____cpython.yaml
+            stable_name: openmm-linux-64-cuda13-py312.conda
+          - label: CUDA 12 / py3.12
+            matrix_file: linux_64_c_stdlib_version2.17cuda_compiler_version12.9python3.12.____cpython.yaml
+            stable_name: openmm-linux-64-cuda12-py312.conda
+          - label: CPU / py3.12
+            matrix_file: _genesis_linux_64_cpu_py312.yaml
+            stable_name: openmm-linux-64-cpu-py312.conda
     steps:
       - name: Free up disk space on runner
-        # conda-build + CUDA 13 SDK is tight on the stock GHA runner (~14 GB free).
-        # Drop the largest pre-installed toolchains we don't need.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
@@ -78,6 +91,49 @@ jobs:
               - conda-forge
             channel_priority: strict
 
+      - name: Generate CPU-only matrix file
+        if: matrix.matrix_file == '_genesis_linux_64_cpu_py312.yaml'
+        run: |
+          cat > "feedstock/.ci_support/${{ matrix.matrix_file }}" <<'YAML'
+          c_compiler:
+          - gcc
+          c_compiler_version:
+          - '14'
+          c_stdlib:
+          - sysroot
+          c_stdlib_version:
+          - '2.17'
+          channel_sources:
+          - conda-forge
+          channel_targets:
+          - conda-forge main
+          cuda_compiler:
+          - cuda-nvcc
+          cuda_compiler_version:
+          - None
+          cxx_compiler:
+          - gxx
+          cxx_compiler_version:
+          - '14'
+          docker_image:
+          - quay.io/condaforge/linux-anvil-x86_64:alma9
+          numpy:
+          - '2'
+          pin_run_as_build:
+            python:
+              min_pin: x.x
+              max_pin: x.x
+          python:
+          - 3.12.* *_cpython
+          target_platform:
+          - linux-64
+          zip_keys:
+          - - c_compiler_version
+            - cxx_compiler_version
+            - c_stdlib_version
+            - cuda_compiler_version
+          YAML
+
       - name: Patch feedstock recipe to use this fork
         shell: bash -el {0}
         env:
@@ -85,7 +141,6 @@ jobs:
         run: |
           set -euo pipefail
           cd feedstock/recipe
-          # SHORT_SHA exported from `github.sha` (full 40-char SHA); trim to 8 chars.
           SHORT_SHA="${SHORT_SHA:0:8}"
           export SHORT_SHA
 
@@ -95,24 +150,22 @@ jobs:
           p = pathlib.Path("meta.yaml")
           text = p.read_text()
 
-          # The recipe at FEEDSTOCK_REF templates the same version (8.5.1) that
-          # this fork's CMakeLists.txt declares, so no version rewrite needed.
-
-          # Replace the `source:` block (terminated by the next blank line or
-          # top-level YAML key) with a `path:` pointing at the sibling openmm
-          # checkout. Multiline mode only (no dotall) — with dotall, `.*`
-          # would consume across newlines and devour the rest of the file.
+          # Replace `source:` with local path.
           text = re.sub(
               r'(?m)^source:\n(?:[ \t]+.*\n)+',
               "source:\n  path: ../../openmm\n",
               text, count=1,
           )
 
-          # Mark the build with `_genesis_<shortsha>` so the binary sorts above
-          # conda-forge's build of the same version (channel priority still
-          # decides selection, but this keeps reproducibility clear).
-          # The recipe templates string: only on osx; on linux conda-build
-          # generates the default. Inject a linux-only string override.
+          # Remove the skip line that blocks CPU-only builds on linux-64.
+          # Original: skip: true  # [(cuda_compiler_version in (undefined, 'None') and (linux64 or win)) ...]
+          text = re.sub(
+              r'(?m)^  skip: true\s+#\s*\[.*cuda_compiler_version in.*linux64.*\]\n',
+              '',
+              text,
+          )
+
+          # Mark the build with `_genesis_<shortsha>`.
           short = os.environ["SHORT_SHA"]
           linux_string = (
               '  string: "py{{ PY_VER.replace(\'.\', \'\') }}h'
@@ -128,9 +181,6 @@ jobs:
           p.write_text(text)
           PY
 
-          # Sanity check: patched recipe must still contain build / requirements /
-          # script — a bad regex earlier silently deleted the entire tail of the
-          # file, producing a 1-minute empty-package build.
           for required in "^build:" "^requirements:" "^test:" "build_openmm.sh"; do
             if ! grep -q "$required" meta.yaml; then
               echo "::error::patched meta.yaml is missing /$required/ — recipe corrupted"
@@ -143,17 +193,12 @@ jobs:
       - name: Build conda package
         shell: bash -el {0}
         env:
-          # Reduce conda-build chatter and keep the work tree on the runner's
-          # large `/mnt` partition so we don't exhaust /home.
           CONDA_BLD_PATH: /mnt/conda-bld
         run: |
           set -euo pipefail
           sudo mkdir -p "$CONDA_BLD_PATH" && sudo chown "$USER:" "$CONDA_BLD_PATH"
-          # conda-build 24.5 doesn't support `--package-format conda`. We
-          # produce the legacy .tar.bz2 here and transmute to .conda in the
-          # next step using conda-package-handling.
           conda-build feedstock/recipe \
-            -m "feedstock/.ci_support/${MATRIX_FILE}" \
+            -m "feedstock/.ci_support/${{ matrix.matrix_file }}" \
             --output-folder ./conda-bld \
             --no-anaconda-upload \
             --no-test
@@ -171,8 +216,6 @@ jobs:
             ls -la ./conda-bld/linux-64/ || true
             exit 1
           fi
-          # cph (conda-package-handling) ships with conda-build and converts
-          # legacy .tar.bz2 to the modern .conda format.
           cph transmute --out-folder ./conda-bld/linux-64 "$TARBALL" .conda
           PKG=$(ls ./conda-bld/linux-64/openmm-*.conda | head -1)
           if [ -z "$PKG" ]; then
@@ -180,8 +223,7 @@ jobs:
             exit 1
           fi
           BASENAME=$(basename "$PKG")
-          # Stable filename for the Release asset so the install script can hardcode it.
-          STABLE=./conda-bld/linux-64/openmm-linux-64-cuda13-py312.conda
+          STABLE=./conda-bld/linux-64/${{ matrix.stable_name }}
           cp "$PKG" "$STABLE"
           echo "package_path=$PKG" >> "$GITHUB_OUTPUT"
           echo "stable_path=$STABLE" >> "$GITHUB_OUTPUT"
@@ -191,7 +233,7 @@ jobs:
       - name: Upload .conda as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openmm-linux-64-cuda13-py312-${{ github.sha }}
+          name: ${{ matrix.stable_name }}-${{ github.sha }}
           path: ./conda-bld/linux-64/openmm-*.conda
           retention-days: 90
           if-no-files-found: error
@@ -200,9 +242,6 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-          # gh release infers the target repo from the local git remote, but
-          # the openmm checkout is in a `path: openmm` subdir so $cwd has no
-          # .git.  Pin the repo explicitly so gh doesn't try to read git.
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -224,7 +263,6 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          # See the tag-push step above for why this is needed.
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
