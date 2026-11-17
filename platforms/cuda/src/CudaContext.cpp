@@ -51,6 +51,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <typeinfo>
@@ -83,6 +84,40 @@ const int CudaContext::ThreadBlockSize = 64;
 const int CudaContext::TileSize = sizeof(tileflags)*8;
 bool CudaContext::hasInitializedCuda = false;
 
+/**
+ * With OPENMM_CUDA_SHARED_CONTEXT=1, every Context in the process uses the device's
+ * primary CUDA context instead of creating and destroying its own.  Creating and
+ * destroying CUDA contexts is serialized by the driver across all processes on a GPU.
+ * The cost is fault isolation: a sticky CUDA error breaks every later Context in the process.
+ */
+static bool useSharedContext() {
+    const char* value = getenv("OPENMM_CUDA_SHARED_CONTEXT");
+    return value != NULL && string(value) == "1";
+}
+
+static CUresult retainSharedContext(CUdevice device, unsigned int flags, CUcontext& context) {
+    static mutex lock;
+    static map<CUdevice, CUcontext> contexts;
+    lock_guard<mutex> guard(lock);
+    auto existing = contexts.find(device);
+    if (existing != contexts.end()) {
+        context = existing->second;
+        return CUDA_SUCCESS;
+    }
+    // Fails harmlessly if another library already activated the primary context.
+    cuDevicePrimaryCtxSetFlags(device, flags & ~CU_CTX_MAP_HOST);
+    CUresult result = cuDevicePrimaryCtxRetain(&context, device);
+    if (result == CUDA_SUCCESS)
+        contexts[device] = context;
+    return result;
+}
+
+static CUresult enablePeerAccess(CUcontext peer) {
+    CUresult result = cuCtxEnablePeerAccess(peer, 0);
+    // Shared primary contexts keep peer access enabled from an earlier Context.
+    return (result == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED ? CUDA_SUCCESS : result);
+}
+
 CudaContext::CudaContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, CudaPlatform::PlatformData& platformData,
         CudaContext* originalContext) : ComputeContext(system), platformData(platformData), contextIsValid(false), hasAssignedPosqCharges(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL), useBlockingSync(useBlockingSync) {
@@ -114,8 +149,10 @@ CudaContext::CudaContext(const System& system, int deviceIndex, bool useBlocking
 #endif
     contextIndex = platformData.contexts.size();
     string errorMessage = "Error initializing Context";
+    isSharedContext = false;
     if (originalContext == NULL) {
         isLinkedContext = false;
+        bool shareContext = useSharedContext();
         int numDevices;
         CHECK_RESULT(cuDeviceGetCount(&numDevices));
         if (deviceIndex < -1 || deviceIndex >= numDevices)
@@ -139,6 +176,14 @@ CudaContext::CudaContext(const System& system, int deviceIndex, bool useBlocking
             else
                 flags += CU_CTX_SCHED_SPIN;
 
+            if (shareContext) {
+                if (retainSharedContext(device, flags, context) == CUDA_SUCCESS) {
+                    this->deviceIndex = trialDeviceIndex;
+                    isSharedContext = true;
+                    break;
+                }
+                continue;
+            }
 #if CUDA_VERSION < 13000
             CUresult result = cuCtxCreate(&context, flags, device);
 #else
@@ -161,6 +206,7 @@ CudaContext::CudaContext(const System& system, int deviceIndex, bool useBlocking
     }
     else {
         isLinkedContext = true;
+        isSharedContext = originalContext->isSharedContext;
         context = originalContext->context;
         this->deviceIndex = originalContext->deviceIndex;
         this->device = originalContext->device;
@@ -198,9 +244,9 @@ CudaContext::CudaContext(const System& system, int deviceIndex, bool useBlocking
         if (canAccess) {
             {
                 ContextSelector selector2(*platformData.contexts[0]);
-                CHECK_RESULT(cuCtxEnablePeerAccess(getContext(), 0));
+                CHECK_RESULT(enablePeerAccess(getContext()));
             }
-            CHECK_RESULT(cuCtxEnablePeerAccess(platformData.contexts[0]->getContext(), 0));
+            CHECK_RESULT(enablePeerAccess(platformData.contexts[0]->getContext()));
         }
     }
     defaultQueue = shared_ptr<ComputeQueueImpl>(new CudaQueue(0));
@@ -385,13 +431,20 @@ CudaContext::~CudaContext() {
         delete bonded;
     if (nonbonded != NULL)
         delete nonbonded;
-    if (contextIsValid && !isLinkedContext)
+    if (isSharedContext) {
+        // Destroying a private context frees its modules; a shared one outlives this Context.
+        for (CUmodule module : loadedModules)
+            cuModuleUnload(module);
+    }
+    else if (contextIsValid && !isLinkedContext)
         cuProfilerStop();
     popAsCurrent();
     string errorMessage = "Error deleting Context";
-    if (contextIsValid && !isLinkedContext)
+    if (contextIsValid && !isLinkedContext && !isSharedContext)
         cuCtxDestroy(context);
-    contextIsValid = false;
+    // A shared context stays valid so member arrays free their memory as they are destroyed.
+    if (!isSharedContext)
+        contextIsValid = false;
 }
 
 void CudaContext::initialize() {
@@ -555,8 +608,10 @@ CUmodule CudaContext::createModule(const string source, const map<string, string
         cacheFile << setw(2) << setfill('0') << (int) hash[i];
     cacheFile << '_' << compileArchitecture << '_' << bits;
     CUmodule module;
-    if (cuModuleLoad(&module, cacheFile.str().c_str()) == CUDA_SUCCESS)
+    if (cuModuleLoad(&module, cacheFile.str().c_str()) == CUDA_SUCCESS) {
+        loadedModules.push_back(module);
         return module;
+    }
 
     // Select a name for the output file.
 
@@ -614,6 +669,7 @@ CUmodule CudaContext::createModule(const string source, const map<string, string
             // An error occurred.  Possibly we don't have permission to write to the temp directory.  Just try to load the module directly.
 
             CHECK_RESULT2(cuModuleLoadDataEx(&module, &ptx[0], 0, NULL, NULL), "Error loading CUDA module");
+            loadedModules.push_back(module);
             return module;
         }
     }
@@ -628,6 +684,7 @@ CUmodule CudaContext::createModule(const string source, const map<string, string
             m<<"Error loading CUDA module: "<<getErrorString(result)<<" ("<<result<<")";
             throw OpenMMException(m.str());
         }
+        loadedModules.push_back(module);
         if (rename(outputFile.c_str(), cacheFile.str().c_str()) != 0)
             remove(outputFile.c_str());
         return module;

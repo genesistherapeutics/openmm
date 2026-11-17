@@ -598,7 +598,8 @@ private:
     int numThreadBlocks;
     int gpuArchitecture;
     bool useBlockingSync, useDoublePrecision, useMixedPrecision, contextIsValid, boxIsTriclinic, hasAssignedPosqCharges;
-    bool isLinkedContext;
+    bool isLinkedContext, isSharedContext;
+    std::vector<CUmodule> loadedModules;
     std::string tempDir, cacheDir;
     float4 periodicBoxVecXFloat, periodicBoxVecYFloat, periodicBoxVecZFloat, periodicBoxSizeFloat, invPeriodicBoxSizeFloat;
     double4 periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, periodicBoxSize, invPeriodicBoxSize;
